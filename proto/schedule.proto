@@ -1,0 +1,128 @@
+syntax = "proto3";
+
+package schedule;
+
+service ScheduleService {
+    // CRUD для тренировок
+    rpc CreateWorkout(CreateWorkoutRequest) returns (WorkoutResponse);
+    rpc GetWorkout(GetWorkoutRequest) returns (WorkoutResponse);
+    rpc UpdateWorkout(UpdateWorkoutRequest) returns (SuccessResponse);
+    rpc DeleteWorkout(DeleteWorkoutRequest) returns (SuccessResponse);
+    rpc ListWorkouts(ListWorkoutsRequest) returns (ListWorkoutsResponse);
+    
+    // Проверка доступности мест
+    rpc CheckAvailability(CheckAvailabilityRequest) returns (AvailabilityResponse);
+    rpc ReserveSlot(ReserveSlotRequest) returns (ReserveSlotResponse);
+    rpc ReleaseSlot(ReleaseSlotRequest) returns (SuccessResponse);
+    
+    // CRUD для тренеров и залов
+    rpc CreateTrainer(CreateTrainerRequest) returns (TrainerResponse);
+    rpc CreateRoom(CreateRoomRequest) returns (RoomResponse);
+}
+
+message CreateWorkoutRequest {
+    string name = 1;
+    string trainer_id = 2;
+    string room_id = 3;
+    string datetime = 4;
+    int32 max_participants = 5;
+    string description = 6;
+}
+
+message GetWorkoutRequest {
+    string workout_id = 1;
+}
+
+message UpdateWorkoutRequest {
+    string workout_id = 1;
+    string name = 2;
+    string trainer_id = 3;
+    string room_id = 4;
+    string datetime = 5;
+    int32 max_participants = 6;
+    string description = 7;
+}
+
+message DeleteWorkoutRequest {
+    string workout_id = 1;
+}
+
+message ListWorkoutsRequest {
+    string date_from = 1;
+    string date_to = 2;
+    optional string trainer_id = 3;
+    optional string room_id = 4;
+}
+
+message CheckAvailabilityRequest {
+    string workout_id = 1;
+}
+
+message ReserveSlotRequest {
+    string workout_id = 1;
+    int32 slots = 2;
+}
+
+message ReleaseSlotRequest {
+    string workout_id = 1;
+    int32 slots = 2;
+}
+
+message CreateTrainerRequest {
+    string name = 1;
+    string specialty = 2;
+    string email = 3;
+    string phone = 4;
+}
+
+message CreateRoomRequest {
+    string name = 1;
+    int32 capacity = 2;
+}
+
+message WorkoutResponse {
+    string workout_id = 1;
+    string name = 2;
+    string trainer_id = 3;
+    string room_id = 4;
+    string datetime = 5;
+    int32 max_participants = 6;
+    int32 current_participants = 7;
+    string description = 8;
+    string status = 9;
+}
+
+message ListWorkoutsResponse {
+    repeated WorkoutResponse workouts = 1;
+}
+
+message AvailabilityResponse {
+    bool available = 1;
+    int32 available_slots = 2;
+}
+
+message ReserveSlotResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message SuccessResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message TrainerResponse {
+    string trainer_id = 1;
+    string name = 2;
+    string specialty = 3;
+    string email = 4;
+    string phone = 5;
+}
+
+message RoomResponse {
+    string room_id = 1;
+    string name = 2;
+    int32 capacity = 3;
+}
+
+message Empty {}

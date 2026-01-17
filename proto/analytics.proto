@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package analytics;
+
+service AnalyticsService {
+    rpc RecordBooking(RecordBookingRequest) returns (SuccessResponse);
+    rpc GetMonthlyStatistics(GetMonthlyStatisticsRequest) returns (MonthlyStatisticsResponse);
+    rpc GetWorkoutStatistics(GetWorkoutStatisticsRequest) returns (WorkoutStatisticsResponse);
+}
+
+message RecordBookingRequest {
+    string user_id = 1;
+    string workout_id = 2;
+    string booking_date = 3;
+}
+
+message GetMonthlyStatisticsRequest {
+    string month_year = 1; // Формат: YYYY-MM
+}
+
+message GetWorkoutStatisticsRequest {
+    string workout_id = 1;
+}
+
+message MonthlyStatisticsResponse {
+    string month_year = 1;
+    int32 total_bookings = 2;
+    int32 unique_users = 3;
+    float booking_growth = 4;
+}
+
+message WorkoutStatisticsResponse {
+    string workout_id = 1;
+    string workout_name = 2;
+    int32 total_bookings = 3;
+    int32 attendance_rate = 4; // Процент посещаемости
+    float avg_participants = 5;
+}
+
+message SuccessResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message Empty {}
