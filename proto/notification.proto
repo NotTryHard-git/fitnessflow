@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package notification;
+
+service NotificationService {
+    rpc SendNotification(SendNotificationRequest) returns (NotificationResponse);
+    rpc GetUserNotifications(GetUserNotificationsRequest) returns (NotificationsResponse);
+}
+
+message SendNotificationRequest {
+    string user_id = 1;
+    string type = 2;
+    string title = 3;
+    string message = 4;
+    string related_booking_id = 5;
+    string related_workout_id = 6;
+}
+
+message GetUserNotificationsRequest {
+    string user_id = 1;
+    int32 limit = 2;
+}
+
+message NotificationResponse {
+    string notification_id = 1;
+    string user_id = 2;
+    string type = 3;
+    string title = 4;
+    string message = 5;
+    string created_at = 6;
+    string related_booking_id = 7;
+    string related_workout_id = 8;
+}
+
+message NotificationsResponse {
+    repeated NotificationResponse notifications = 1;
+}

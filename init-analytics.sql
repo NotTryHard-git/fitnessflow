@@ -1,4 +1,5 @@
 -- Инициализация базы данных Analytics Service
+DROP DATABASE analytics_db;
 CREATE DATABASE analytics_db;
 \c analytics_db;
 

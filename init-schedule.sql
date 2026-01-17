@@ -1,5 +1,6 @@
 -- Инициализация базы данных Schedule Service
-CREATE DATABASE schedule_db;
+DROP DATABASE schedule_db;
+CREATE DATABASE  schedule_db;
 \c schedule_db;
 
 -- Таблица тренировок

@@ -1,16 +1,12 @@
-import grpc
 import asyncio
-import asyncpg as pg
-import json
-import uuid
-from datetime import datetime, timedelta
+import asyncpg
+import grpc
+from concurrent import futures
 import logging
-import os
-import threading
-import time
-import queue
-from kafka import KafkaProducer, KafkaConsumer
-import schedule_pb2, schedule_pb2_grpc
+from datetime import datetime
+
+import schedule_pb2
+import schedule_pb2_grpc
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,206 +15,26 @@ logging.basicConfig(
 logger = logging.getLogger('ScheduleService')
 
 class ScheduleService(schedule_pb2_grpc.ScheduleServiceServicer):
+    
     def __init__(self):
-        logger.info('Initializing Schedule Service...')
         self.pg_conn = None
-        self.kafka_producer = None
-        self.kafka_consumer = None
-        self.consumer_thread = None
-        self.message_queue = queue.Queue()
-        self.running = False
         
-        # Инициализируем только Producer сразу
-        self.init_kafka_producer()
-    
-    def init_kafka_producer(self):
-        """Инициализация только Kafka producer"""
-        try:
-            logger.info("Initializing Kafka producer...")
-            self.kafka_producer = KafkaProducer(
-                bootstrap_servers=['kafka:9092'],
-                value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-                api_version=(2, 5, 0),
-                acks='all',
-                retries=3,
-                max_block_ms=5000
-            )
-            logger.info("Kafka producer initialized successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize Kafka producer: {e}")
-            logger.warning("Kafka producer will not be available")
-            self.kafka_producer = None
-    
-    def start_kafka_consumer_thread(self):
-        """Запуск Kafka Consumer в отдельном потоке"""
-        if self.consumer_thread and self.consumer_thread.is_alive():
-            return
-        
-        logger.info("Starting Kafka consumer thread...")
-        self.running = True
-        self.consumer_thread = threading.Thread(
-            target=self.kafka_consumer_worker,
-            daemon=True
-        )
-        self.consumer_thread.start()
-    
-    def kafka_consumer_worker(self):
-        """Рабочая функция для потока Consumer"""
-        logger.info("Kafka consumer worker started")
-        
-        try:
-            # Инициализируем Consumer в этом потоке
-            consumer = KafkaConsumer(
-                'user-validated',
-                'user-invalid',
-                'schedule-check',
-                bootstrap_servers=['kafka:9092'],
-                group_id=f'schedule-service-{uuid.uuid4().hex[:8]}',
-                value_deserializer=lambda v: json.loads(v.decode('utf-8')),
-                auto_offset_reset='earliest',
-                enable_auto_commit=True,
-                api_version=(2, 5, 0),
-                consumer_timeout_ms=2000
-            )
-            
-            logger.info("Kafka consumer connected successfully")
-            
-            while self.running:
-                try:
-                    # Получаем сообщения
-                    message_batch = consumer.poll(timeout_ms=1000)
-                    
-                    if message_batch:
-                        for tp, messages in message_batch.items():
-                            for message in messages:
-                                logger.info(f"Received message from topic: {message.topic}")
-                                # Ставим сообщение в очередь для обработки
-                                self.message_queue.put({
-                                    'topic': message.topic,
-                                    'value': message.value,
-                                    'timestamp': message.timestamp
-                                })
-                    
-                    # Периодически коммитим оффсеты
-                    consumer.commit_async()
-                    
-                except Exception as e:
-                    logger.error(f"Error in consumer poll: {e}")
-                    time.sleep(1)
-                    
-        except Exception as e:
-            logger.error(f"Kafka consumer worker error: {e}")
-        finally:
-            logger.info("Kafka consumer worker stopped")
-    
-    async def process_message_queue(self):
-        """Обработка сообщений из очереди (вызывается из основного цикла)"""
-        while not self.message_queue.empty():
-            try:
-                message = self.message_queue.get_nowait()
-                await self.handle_saga_message(message)
-            except queue.Empty:
-                break
-            except Exception as e:
-                logger.error(f"Error processing queued message: {e}")
-    
-    async def handle_saga_message(self, message):
-        """Обработка сообщений Saga"""
-        try:
-            event = message['value']
-            topic = message['topic']
-            booking_id = event.get('booking_id')
-            
-            logger.info(f"Processing {topic} for booking {booking_id}")
-            
-            if topic == 'user-validated' or topic == 'schedule-check':
-                # Проверяем доступность мест
-                available = await self.check_availability_db(
-                    event['workout_id']
-                )
-                
-                if available:
-                    # Резервируем слот
-                    success = await self.reserve_slot_db(
-                        event['workout_id'],
-                        slots=1
-                    )
-                    
-                    if success and self.kafka_producer:
-                        try:
-                            # Публикуем событие успеха
-                            slot_event = {
-                                'booking_id': booking_id,
-                                'user_id': event['user_id'],
-                                'workout_id': event['workout_id'],
-                                'timestamp': datetime.now().isoformat()
-                            }
-                            future = self.kafka_producer.send('slot-reserved', slot_event)
-                            await asyncio.get_event_loop().run_in_executor(
-                                None, lambda: future.get(timeout=3)
-                            )
-                            logger.info(f"Slot reserved for booking {booking_id}")
-                        except Exception as e:
-                            logger.error(f"Failed to send slot-reserved event: {e}")
-                    else:
-                        await self.send_rejection_event(event, booking_id, 'No available slots')
-                else:
-                    await self.send_rejection_event(event, booking_id, 'No available slots')
-            
-            elif topic == 'user-invalid':
-                # Откатываем операцию, если была резервация
-                await self.release_slot_db(
-                    event.get('workout_id'),
-                    slots=1
-                )
-        
-        except Exception as e:
-            logger.error(f"Error handling saga message: {e}")
-    
-    async def send_rejection_event(self, event, booking_id, reason):
-        """Отправка события отказа"""
-        try:
-            if self.kafka_producer:
-                rejection_event = {
-                    'booking_id': booking_id,
-                    'user_id': event['user_id'],
-                    'workout_id': event['workout_id'],
-                    'reason': reason,
-                    'timestamp': datetime.now().isoformat()
-                }
-                future = self.kafka_producer.send('slot-rejected', rejection_event)
-                await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: future.get(timeout=3)
-                )
-                logger.info(f"Slot rejected for booking {booking_id}: {reason}")
-        except Exception as e:
-            logger.error(f"Failed to send rejection event: {e}")
-    
     async def pg_connect(self):
-        """Подключение к PostgreSQL"""
-        max_retries = 5
-        for attempt in range(max_retries):
+        for _ in range(5):
             try:
-                logger.info(f"PostgreSQL connection attempt {attempt + 1}/{max_retries}")
-                self.pg_conn = await pg.connect(
+                self.pg_conn = await asyncpg.connect(
                     host='postgres-schedule',
                     database='schedule_db',
                     user='postgres',
                     password='postgres',
                     port=5432
                 )
-                logger.info("Successfully connected to PostgreSQL")
-                
-                # Создаем таблицы если их нет
+                logger.info("Successfully connected to schedule database")
                 await self.setup_tables()
                 break
             except Exception as e:
-                logger.error(f"PostgreSQL connection error: {e}")
-                if attempt == max_retries - 1:
-                    raise
-                await asyncio.sleep(3)
-    
+                logger.error(f"Database connection error, attempt {_}: {e}")
+                await asyncio.sleep(5)
     async def setup_tables(self):
         """Создание таблиц в PostgreSQL"""
         try:
@@ -299,323 +115,288 @@ class ScheduleService(schedule_pb2_grpc.ScheduleServiceServicer):
         except Exception as e:
             logger.error(f"Error creating tables: {e}")
             raise
-    
-    async def CreateWorkout(self, request, context):
-        """Создание тренировки"""
-        try:
-            workout_id = str(uuid.uuid4())
-
-            # Валидация datetime
-            if not request.datetime:
-                raise ValueError("Datetime is required")
-
-            # Пытаемся преобразовать строку в datetime
-            try:
-                # Проверяем формат даты
-                workout_datetime = datetime.fromisoformat(request.datetime.replace('Z', '+00:00'))
-            except ValueError:
-                raise ValueError(f"Invalid datetime format: {request.datetime}. Expected ISO format")
-
-            # Валидация других полей
-            if not request.name or not request.trainer_id or not request.room_id:
-                raise ValueError("Name, trainer_id and room_id are required")
-
-            if request.max_participants <= 0:
-                raise ValueError("max_participants must be positive")
-
-            await self.pg_conn.execute("""
-                INSERT INTO workouts (
-                    workout_id, name, trainer_id, room_id, 
-                    datetime, max_participants, description, status
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')
-            """, workout_id, request.name, request.trainer_id, 
-               request.room_id, workout_datetime, 
-               request.max_participants, request.description or "")
-
-            logger.info(f"Workout created: {workout_id} ({request.name})")
-
-            return schedule_pb2.WorkoutResponse(
-                workout_id=workout_id,
-                name=request.name,
-                trainer_id=request.trainer_id,
-                room_id=request.room_id,
-                datetime=workout_datetime.isoformat(),
-                max_participants=request.max_participants,
-                current_participants=0,
-                description=request.description or "",
-                status='active'
-            )
-        except ValueError as e:
-            logger.error(f"CreateWorkout validation error: {e}")
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details(str(e))
-            return schedule_pb2.WorkoutResponse()
-        except Exception as e:
-            logger.error(f"CreateWorkout error: {e}")
-            context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details(str(e))
-            return schedule_pb2.WorkoutResponse()
-    
     async def GetWorkout(self, request, context):
-        """Получение информации о тренировке"""
         try:
-            record = await self.pg_conn.fetchrow(
-                "SELECT * FROM workouts WHERE workout_id = $1", 
+            workout = await self.pg_conn.fetchrow(
+                "SELECT * FROM workouts WHERE workout_id = $1",
                 request.workout_id
             )
             
-            if not record:
+            if not workout:
                 context.set_code(grpc.StatusCode.NOT_FOUND)
-                context.set_details("Workout not found")
+                context.set_details('Workout not found')
                 return schedule_pb2.WorkoutResponse()
             
             return schedule_pb2.WorkoutResponse(
-                workout_id=record['workout_id'],
-                name=record['name'],
-                trainer_id=record['trainer_id'],
-                room_id=record['room_id'],
-                datetime=str(record['datetime']),
-                max_participants=record['max_participants'],
-                current_participants=record['current_participants'],
-                description=record['description'],
-                status=record['status']
+                workout_id=str(workout['workout_id']),
+                name=str(workout['name']),
+                trainer_id=str(workout['trainer_id']),
+                room_id=str(workout['room_id']),
+                datetime=str(workout['datetime']),
+                max_participants=int(workout['max_participants']),
+                current_participants=int(workout['current_participants']),
+                description=str(workout['description']),
+                status=str(workout['status'])
             )
         except Exception as e:
-            logger.error(f"GetWorkout error: {e}")
+            logger.error(f'GetWorkout failed: {str(e)}')
             context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details(str(e))
+            context.set_details(f'GetWorkout failed: {str(e)}')
             return schedule_pb2.WorkoutResponse()
     
-    async def ListWorkouts(self, request, context):
-        """Список тренировок"""
+    async def GetWorkouts(self, request, context):
         try:
-            query = "SELECT * FROM workouts WHERE status = 'active'"
-            params = []
+            # Преобразуем строки дат в datetime объекты
+            date_from = None
+            date_to = None
             
             if request.date_from:
-                query += " AND datetime >= $1"
-                # Валидация datetime
                 try:
-                    # Проверяем формат даты
-                    workout_datetime = datetime.fromisoformat(request.date_from.replace('Z', '+00:00'))
+                    date_from = datetime.strptime(request.date_from, '%Y-%m-%d')
                 except ValueError:
-                    raise ValueError(f"Invalid datetime format: {request.date_from}. Expected ISO format")
-            
-                params.append(workout_datetime)
+                    # Если передано с временем, пробуем другой формат
+                    try:
+                        date_from = datetime.strptime(request.date_from, '%Y-%m-%d %H:%M:%S')
+                    except ValueError:
+                        try:
+                            date_from = datetime.strptime(request.date_from, '%Y-%m-%dT%H:%M:%S')
+                        except ValueError as e:
+                            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                            context.set_details(f"Invalid date_from format: {request.date_from}")
+                            return schedule_pb2.WorkoutsResponse()
             
             if request.date_to:
-                if len(params) == 0:
-                    query += " AND datetime <= $1"
-                else:
-                    query += " AND datetime <= $2"
-                # Валидация datetime
                 try:
-                    # Проверяем формат даты
-                    workout_datetime = datetime.fromisoformat(request.date_to.replace('Z', '+00:00'))
+                    date_to = datetime.strptime(request.date_to, '%Y-%m-%d')
                 except ValueError:
-                    raise ValueError(f"Invalid datetime format: {request.date_to}. Expected ISO format")
+                    try:
+                        date_to = datetime.strptime(request.date_to, '%Y-%m-%d %H:%M:%S')
+                    except ValueError:
+                        try:
+                            date_to = datetime.strptime(request.date_to, '%Y-%m-%dT%H:%M:%S')
+                        except ValueError as e:
+                            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                            context.set_details(f"Invalid date_to format: {request.date_to}")
+                            return schedule_pb2.WorkoutsResponse()
             
-                params.append(workout_datetime)
+            # Если не указаны даты, используем сегодня и неделю вперед
+            if not date_from:
+                date_from = datetime.now()
+            if not date_to:
+                date_to = date_from + timedelta(days=7)
             
-            if request.trainer_id:
-                if len(params) == 0:
-                    query += " AND trainer_id = $1"
-                elif len(params) == 1:
-                    query += " AND trainer_id = $2"
-                else:
-                    query += " AND trainer_id = $3"
-                params.append(request.trainer_id)
+            workouts = await self.pg_conn.fetch(
+                """
+                SELECT * FROM workouts 
+                WHERE datetime >= $1::timestamp 
+                AND datetime <= $2::timestamp 
+                AND status = 'active'
+                ORDER BY datetime
+                """,
+                date_from,
+                date_to
+            )
             
-            if request.room_id:
-                if len(params) == 0:
-                    query += " AND room_id = $1"
-                elif len(params) == 1:
-                    query += " AND room_id = $2"
-                elif len(params) == 2:
-                    query += " AND room_id = $3"
-                else:
-                    query += " AND room_id = $4"
-                params.append(request.room_id)
-            
-            query += " ORDER BY datetime"
-            
-            records = await self.pg_conn.fetch(query, *params)
-            
-            workouts = []
-            for record in records:
-                workouts.append(schedule_pb2.WorkoutResponse(
-                    workout_id=record['workout_id'],
-                    name=record['name'],
-                    trainer_id=record['trainer_id'],
-                    room_id=record['room_id'],
-                    datetime=str(record['datetime']),
-                    max_participants=record['max_participants'],
-                    current_participants=record['current_participants'],
-                    description=record['description'],
-                    status=record['status']
+            response = schedule_pb2.WorkoutsResponse()
+            for workout in workouts:
+                response.workouts.append(schedule_pb2.WorkoutResponse(
+                    workout_id=str(workout['workout_id']),
+                    name=str(workout['name']),
+                    trainer_id=str(workout['trainer_id']),
+                    room_id=str(workout['room_id']),
+                    datetime=str(workout['datetime']),
+                    max_participants=int(workout['max_participants']),
+                    current_participants=int(workout['current_participants']),
+                    description=str(workout['description']),
+                    status=str(workout['status'])
                 ))
             
-            return schedule_pb2.ListWorkoutsResponse(workouts=workouts)
+            return response
         except Exception as e:
-            logger.error(f"ListWorkouts error: {e}")
+            logger.error(f'GetWorkouts failed: {str(e)}')
             context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details(str(e))
-            return schedule_pb2.ListWorkoutsResponse()
-    
-    async def CheckAvailability(self, request, context):
-        """Проверка доступности мест"""
-        try:
-            available = await self.check_availability_db(request.workout_id)
-            
-            return schedule_pb2.AvailabilityResponse(
-                available=available,
-                available_slots=1 if available else 0
-            )
-        except Exception as e:
-            logger.error(f"CheckAvailability error: {e}")
-            context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details(str(e))
-            return schedule_pb2.AvailabilityResponse()
-    
-    async def check_availability_db(self, workout_id):
-        """Проверка доступности мест в базе данных"""
-        try:
-            record = await self.pg_conn.fetchrow(
-                "SELECT max_participants, current_participants FROM workouts WHERE workout_id = $1",
-                workout_id
-            )
-            
-            if not record:
-                return False
-            
-            return record['current_participants'] < record['max_participants']
-        except Exception as e:
-            logger.error(f"check_availability_db error: {e}")
-            return False
+            context.set_details(f'GetWorkouts failed: {str(e)}')
+            return schedule_pb2.WorkoutsResponse()
     
     async def ReserveSlot(self, request, context):
-        """Резервирование места"""
         try:
-            success = await self.reserve_slot_db(request.workout_id, request.slots)
-            
+            async with self.pg_conn.transaction():
+                # Check current participants
+                workout = await self.pg_conn.fetchrow(
+                    "SELECT current_participants, max_participants FROM workouts WHERE workout_id = $1",
+                    request.workout_id
+                )
+                
+                if not workout:
+                    return schedule_pb2.ReserveSlotResponse(
+                        success=False,
+                        message='Workout not found'
+                    )
+                
+                if workout['current_participants'] >= workout['max_participants']:
+                    return schedule_pb2.ReserveSlotResponse(
+                        success=False,
+                        message='No available slots'
+                    )
+                
+                # Increment participants
+                await self.pg_conn.execute(
+                    """
+                    UPDATE workouts 
+                    SET current_participants = current_participants + 1,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE workout_id = $1
+                    """,
+                    request.workout_id
+                )
+                
+                # Get updated count
+                updated = await self.pg_conn.fetchrow(
+                    "SELECT current_participants FROM workouts WHERE workout_id = $1",
+                    request.workout_id
+                )
+                
+                return schedule_pb2.ReserveSlotResponse(
+                    success=True,
+                    message='Slot reserved successfully',
+                    current_participants=updated['current_participants']
+                )
+        except Exception as e:
+            logger.error(f'ReserveSlot failed: {str(e)}')
             return schedule_pb2.ReserveSlotResponse(
-                success=success,
-                message="Slot reserved" if success else "Failed to reserve slot"
+                success=False,
+                message=f'ReserveSlot failed: {str(e)}'
             )
-        except Exception as e:
-            logger.error(f"ReserveSlot error: {e}")
-            context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details(str(e))
-            return schedule_pb2.ReserveSlotResponse(success=False)
     
-    async def reserve_slot_db(self, workout_id, slots=1):
-        """Резервирование места в базе данных"""
+    async def CancelReservation(self, request, context):
         try:
-            await self.pg_conn.execute("""
-                UPDATE workouts 
-                SET current_participants = current_participants + $1
-                WHERE workout_id = $2 
-                AND (current_participants + $1) <= max_participants
-            """, slots, workout_id)
-            
-            return True
+            async with self.pg_conn.transaction():
+                # Decrement participants (but not below 0)
+                await self.pg_conn.execute(
+                    """
+                    UPDATE workouts 
+                    SET current_participants = GREATEST(current_participants - 1, 0),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE workout_id = $1
+                    """,
+                    request.workout_id
+                )
+                
+                return schedule_pb2.SuccessResponse(
+                    success=True,
+                    message='Reservation cancelled'
+                )
         except Exception as e:
-            logger.error(f"reserve_slot_db error: {e}")
-            return False
-    
-    async def ReleaseSlot(self, request, context):
-        """Освобождение места"""
-        try:
-            await self.release_slot_db(request.workout_id, request.slots)
-            
+            logger.error(f'CancelReservation failed: {str(e)}')
             return schedule_pb2.SuccessResponse(
-                success=True,
-                message="Slot released"
+                success=False,
+                message=f'CancelReservation failed: {str(e)}'
+            )
+    
+    async def CreateWorkout(self, request, context):
+        try:
+            workout_id = f'workout-{datetime.now().strftime("%Y%m%d%H%M%S")}'
+
+            # Преобразуем строку datetime в timestamp
+            workout_datetime = None
+            if request.datetime:
+                try:
+                    # Пробуем разные форматы даты
+                    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d'):
+                        try:
+                            workout_datetime = datetime.strptime(request.datetime, fmt)
+                            break
+                        except ValueError:
+                            continue
+                    if not workout_datetime:
+                        raise ValueError(f"Invalid datetime format: {request.datetime}")
+                except Exception as e:
+                    logger.error(f"Error parsing datetime: {e}")
+                    context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                    context.set_details(f"Invalid datetime format: {request.datetime}")
+                    return schedule_pb2.WorkoutResponse()
+
+            await self.pg_conn.execute(
+                """
+                INSERT INTO workouts 
+                (workout_id, name, trainer_id, room_id, datetime, max_participants, description)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """,
+                workout_id,
+                request.name,
+                request.trainer_id,
+                request.room_id,
+                workout_datetime,  # Теперь это datetime объект
+                request.max_participants,
+                request.description
+            )
+
+            return await self.GetWorkout(
+                schedule_pb2.GetWorkoutRequest(workout_id=workout_id),
+                context
             )
         except Exception as e:
-            logger.error(f"ReleaseSlot error: {e}")
+            logger.error(f'CreateWorkout failed: {str(e)}')
             context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details(str(e))
-            return schedule_pb2.SuccessResponse(success=False)
+            context.set_details(f'CreateWorkout failed: {str(e)}')
+            return schedule_pb2.WorkoutResponse()
     
-    async def release_slot_db(self, workout_id, slots=1):
-        """Освобождение места в базе данных"""
+    async def GetTrainers(self, request, context):
         try:
-            await self.pg_conn.execute("""
-                UPDATE workouts 
-                SET current_participants = GREATEST(0, current_participants - $1)
-                WHERE workout_id = $2
-            """, slots, workout_id)
+            trainers = await self.pg_conn.fetch("SELECT * FROM trainers")
+            
+            response = schedule_pb2.TrainersResponse()
+            for trainer in trainers:
+                response.trainers.append(schedule_pb2.TrainerResponse(
+                    trainer_id=str(trainer['trainer_id']),
+                    name=str(trainer['name']),
+                    specialty=str(trainer['specialty']),
+                    email=str(trainer['email']),
+                    phone=str(trainer['phone'])
+                ))
+            
+            return response
         except Exception as e:
-            logger.error(f"release_slot_db error: {e}")
+            logger.error(f'GetTrainers failed: {str(e)}')
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(f'GetTrainers failed: {str(e)}')
+            return schedule_pb2.TrainersResponse()
     
-    def stop_kafka_consumer(self):
-        """Остановка Kafka Consumer"""
-        logger.info("Stopping Kafka consumer...")
-        self.running = False
-        if self.consumer_thread:
-            self.consumer_thread.join(timeout=5)
-    
-    async def cleanup(self):
-        """Очистка ресурсов"""
+    async def GetRooms(self, request, context):
         try:
-            self.stop_kafka_consumer()
-            if self.kafka_producer:
-                self.kafka_producer.close()
-            if self.pg_conn:
-                await self.pg_conn.close()
+            rooms = await self.pg_conn.fetch("SELECT * FROM rooms")
+            
+            response = schedule_pb2.RoomsResponse()
+            for room in rooms:
+                response.rooms.append(schedule_pb2.RoomResponse(
+                    room_id=str(room['room_id']),
+                    name=str(room['name']),
+                    capacity=room['capacity']
+                ))
+            
+            return response
         except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
-
-async def periodic_queue_processor(service, interval=1):
-    """Периодическая обработка очереди сообщений"""
-    while True:
-        try:
-            await service.process_message_queue()
-        except Exception as e:
-            logger.error(f"Error in queue processor: {e}")
-        await asyncio.sleep(interval)
+            logger.error(f'GetRooms failed: {str(e)}')
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(f'GetRooms failed: {str(e)}')
+            return schedule_pb2.RoomsResponse()
 
 async def serve():
-    """Запуск gRPC сервера"""
     server = grpc.aio.server()
     service = ScheduleService()
+    await service.pg_connect()
+    schedule_pb2_grpc.add_ScheduleServiceServicer_to_server(service, server)
+    server.add_insecure_port('[::]:50051')
     
-    try:
-        # 1. Подключаемся к PostgreSQL
-        await service.pg_connect()
-        
-        # 2. Регистрируем сервис
-        schedule_pb2_grpc.add_ScheduleServiceServicer_to_server(service, server)
-        server.add_insecure_port('[::]:50051')
-        
-        # 3. Запускаем gRPC сервер
-        await server.start()
-        logger.info("✅ Schedule Service gRPC server started on [::]:50051")
-        
-        # 4. Запускаем Kafka Consumer в отдельном потоке
-        service.start_kafka_consumer_thread()
-        
-        # 5. Запускаем обработчик очереди сообщений
-        queue_task = asyncio.create_task(periodic_queue_processor(service))
-        
-        # 6. Бесконечный цикл ожидания
-        await server.wait_for_termination()
-        
-        # 7. Отменяем задачу обработки очереди
-        queue_task.cancel()
-        
-    except Exception as e:
-        logger.critical(f" Failed to start service: {e}")
-        raise
-    finally:
-        await service.cleanup()
+    await server.start()
+    logger.info("Schedule Service started on port 50051")
+    
+    await server.wait_for_termination()
 
 if __name__ == '__main__':
     try:
-        logger.info("Starting Schedule Service with Kafka Saga support...")
         asyncio.run(serve())
     except KeyboardInterrupt:
-        logger.info(" Service stopped by user")
+        logger.info("Schedule Service stopped by user")
     except Exception as e:
-        logger.error(f" Service crashed: {e}")
+        logger.error(f"Schedule Service crashed: {str(e)}")

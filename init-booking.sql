@@ -1,4 +1,5 @@
 -- Инициализация базы данных Booking Service
+DROP DATABASE booking_db;
 CREATE DATABASE booking_db;
 \c booking_db;
 

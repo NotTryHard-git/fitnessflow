@@ -2,11 +2,15 @@ syntax = "proto3";
 
 package booking;
 
+import "user.proto";
+import "schedule.proto";
+
 service BookingService {
     rpc CreateBooking(CreateBookingRequest) returns (BookingResponse);
-    rpc CancelBooking(CancelBookingRequest) returns (SuccessResponse);
+    rpc CancelBooking(CancelBookingRequest) returns (BookingResponse);
+    rpc GetUserBookings(GetUserBookingsRequest) returns (BookingsResponse);
     rpc GetBooking(GetBookingRequest) returns (BookingResponse);
-    rpc GetUserBookings(GetUserBookingsRequest) returns (UserBookingsResponse);
+    rpc UserValidated(UserValidationRequest) returns (UserValidationResponse);
 }
 
 message CreateBookingRequest {
@@ -16,16 +20,24 @@ message CreateBookingRequest {
 
 message CancelBookingRequest {
     string booking_id = 1;
-    string reason = 2;
+}
+
+message GetUserBookingsRequest {
+    string user_id = 1;
 }
 
 message GetBookingRequest {
     string booking_id = 1;
 }
 
-message GetUserBookingsRequest {
+message UserValidationRequest {
     string user_id = 1;
-    optional string status = 2;
+    string workout_id = 2;
+}
+
+message UserValidationResponse {
+    bool valid = 1;
+    string message = 2;
 }
 
 message BookingResponse {
@@ -35,16 +47,8 @@ message BookingResponse {
     string status = 4;
     string created_at = 5;
     string updated_at = 6;
-    string reason = 7;
 }
 
-message UserBookingsResponse {
+message BookingsResponse {
     repeated BookingResponse bookings = 1;
 }
-
-message SuccessResponse {
-    bool success = 1;
-    string message = 2;
-}
-
-message Empty {}

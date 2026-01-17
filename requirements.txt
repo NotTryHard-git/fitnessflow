@@ -1,9 +1,9 @@
+kafka-python==2.0.2
+asyncio==3.4.3
 grpcio==1.60.0
 grpcio-tools==1.60.0
-Flask[async]==3.0.0  
-kafka-python==2.0.2
 asyncpg==0.29.0
-asyncio==3.4.3
+Flask[async]==3.0.0  
+aiokafka==0.8.0
 circuitbreaker==1.4.0
-python-dateutil==2.8.2
-PyJWT==2.8.0
+protobuf==4.25.1
