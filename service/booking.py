@@ -6,7 +6,8 @@ import json
 import aiokafka
 from datetime import datetime
 import logging
-from circuitbreaker import circuit
+from circuitbreaker import circuit, CircuitBreaker
+from typing import Tuple
 
 import booking_pb2
 import booking_pb2_grpc
@@ -21,6 +22,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger('BookingService')
 
+# Глобальный Circuit Breaker для User Service
+user_service_circuit_breaker = CircuitBreaker(
+    failure_threshold=5,           # Открывается после 5 ошибок
+    recovery_timeout=30,           # Закрывается через 30 секунд
+    name="UserServiceCircuitBreaker",
+    expected_exception=grpc.RpcError  # Обрабатываем gRPC ошибки
+)
+
 class BookingService(booking_pb2_grpc.BookingServiceServicer):
     
     def __init__(self):
@@ -28,6 +37,9 @@ class BookingService(booking_pb2_grpc.BookingServiceServicer):
         self.kafka_producer = None
         self.user_service_address = 'user-service:50052'
         self.schedule_service_address = 'schedule-service:50051'
+        self.circuit_breaker_state = 'CLOSED'  # CLOSED, OPEN, HALF_OPEN
+        self.circuit_breaker_failures = 0
+        self.last_failure_time = None
         
     async def pg_connect(self):
         for _ in range(5):
@@ -94,36 +106,204 @@ class BookingService(booking_pb2_grpc.BookingServiceServicer):
         except Exception as e:
             logger.error(f"Kafka connection error: {e}")
     
-    async def CreateBooking(self, request, context):
+    @circuit(failure_threshold=5, recovery_timeout=30)
+    async def validate_user_with_circuit_breaker(self, user_id: str) -> Tuple[bool, str]:
+        """
+        Валидация пользователя с Circuit Breaker защитой
+        
+        Args:
+            user_id: ID пользователя для валидации
+            
+        Returns:
+            Tuple[bool, str]: (валиден ли пользователь, сообщение)
+            
+        Raises:
+            Exception: Если Circuit Breaker открыт или произошла ошибка
+        """
         try:
-            # Start SAGA: Step 1 - Validate User Subscription
-            validation = await self.UserValidated(
-                booking_pb2.UserValidationRequest(
-                    user_id=request.user_id,
-                    workout_id=request.workout_id
-                ),
-                context
-            )
+            logger.info(f"Validating user {user_id} through User Service...")
             
-            if not validation.valid:
-                await self.publish_booking_cancelled(request.user_id, request.workout_id, validation.message)
-                return booking_pb2.BookingResponse()
-            
-            # Step 2 - Reserve slot in Schedule Service
-            async with grpc.aio.insecure_channel(self.schedule_service_address) as channel:
-                stub = schedule_pb2_grpc.ScheduleServiceStub(channel)
-                reserve_response = await stub.ReserveSlot(
-                    schedule_pb2.ReserveSlotRequest(
-                        workout_id=request.workout_id
-                    )
+            async with grpc.aio.insecure_channel(self.user_service_address) as channel:
+                stub = user_pb2_grpc.UserServiceStub(channel)
+                response = await stub.ValidateSubscription(
+                    user_pb2.ValidateSubscriptionRequest(user_id=user_id),
+                    timeout=2.0
                 )
             
-            if not reserve_response.success:
-                await self.publish_booking_cancelled(request.user_id, request.workout_id, reserve_response.message)
+            if response.valid:
+                logger.info(f"User {user_id} validation successful")
+                return True, response.message
+            else:
+                logger.warning(f"User {user_id} validation failed: {response.message}")
+                return False, response.message
+                
+        except grpc.RpcError as e:
+            logger.warning(f"User service gRPC error: {e.code()} - {e.details()}")
+            raise  # Пробрасываем для Circuit Breaker
+            
+        except Exception as e:
+            logger.error(f"Unexpected error in user validation: {e}")
+            raise
+    
+    async def check_and_update_circuit_breaker(self, error_occurred: bool = False):
+        """
+        Проверка и обновление состояния Circuit Breaker
+        
+        Args:
+            error_occurred: Произошла ли ошибка в текущем запросе
+        """
+        if error_occurred:
+            self.circuit_breaker_failures += 1
+            self.last_failure_time = datetime.now()
+            
+            if self.circuit_breaker_failures >= 5 and self.circuit_breaker_state != 'OPEN':
+                self.circuit_breaker_state = 'OPEN'
+                logger.warning(f"⚡ CIRCUIT BREAKER IS NOW OPEN! (failures: {self.circuit_breaker_failures})")
+        else:
+            # Сброс счетчика при успешном запросе
+            if self.circuit_breaker_state != 'CLOSED':
+                self.circuit_breaker_state = 'CLOSED'
+                self.circuit_breaker_failures = 0
+                logger.info("✓ CIRCUIT BREAKER IS NOW CLOSED")
+    
+    async def can_proceed_with_booking(self) -> Tuple[bool, str]:
+        """
+        Проверка, можно ли продолжить с бронированием (проверка Circuit Breaker)
+        
+        Returns:
+            Tuple[bool, str]: (можно продолжать, причина)
+        """
+        if self.circuit_breaker_state == 'OPEN':
+            # Проверяем, не истек ли таймаут восстановления
+            if self.last_failure_time:
+                time_since_failure = (datetime.now() - self.last_failure_time).seconds
+                if time_since_failure >= 30:
+                    # Переходим в HALF_OPEN для тестирования
+                    self.circuit_breaker_state = 'HALF_OPEN'
+                    logger.info("Circuit Breaker transitioned to HALF_OPEN state")
+                    return True, "Testing in HALF_OPEN state"
+            
+            return False, "Circuit Breaker is OPEN - User service unavailable"
+        
+        return True, "Circuit Breaker is CLOSED - Proceeding normally"
+    
+    async def CreateBooking(self, request, context):
+        """
+        Создание бронирования с защитой Circuit Breaker
+        
+        Workflow:
+        1. Проверка состояния Circuit Breaker
+        2. Валидация пользователя (защищено Circuit Breaker)
+        3. Резервирование слота в Schedule Service
+        4. Создание записи бронирования
+        5. Публикация события
+        """
+        logger.info(f"Creating booking for user {request.user_id}, workout {request.workout_id}")
+        
+        try:
+            # Шаг 1: Проверка Circuit Breaker
+            can_proceed, reason = await self.can_proceed_with_booking()
+            if not can_proceed:
+                logger.warning(f"CIRCUIT BREAKER BLOCKED: {reason}")
+                
+                await self.publish_booking_cancelled(
+                    request.user_id,
+                    request.workout_id,
+                    f"Service unavailable: {reason}"
+                )
+                
+                context.set_code(grpc.StatusCode.UNAVAILABLE)
+                context.set_details(f"CIRCUIT BREAKER: {reason}")
                 return booking_pb2.BookingResponse()
             
-            # Step 3 - Create booking record
+            # Шаг 2: Валидация пользователя
+            user_valid = False
+            user_validation_message = ""
+            
+            try:
+                user_valid, user_validation_message = await self.validate_user_with_circuit_breaker(request.user_id)
+                await self.check_and_update_circuit_breaker(error_occurred=False)
+                
+            except Exception as e:
+                await self.check_and_update_circuit_breaker(error_occurred=True)
+                
+                # Если мы в HALF_OPEN состоянии и получили ошибку, возвращаемся в OPEN
+                if self.circuit_breaker_state == 'HALF_OPEN':
+                    self.circuit_breaker_state = 'OPEN'
+                    logger.warning("HALF_OPEN test failed, returning to OPEN state")
+                
+                logger.error(f"User validation failed with Circuit Breaker: {e}")
+                
+                # Fallback логика: разрешаем бронирование без проверки?
+                # В реальной системе это бизнес-решение
+                ALLOW_BOOKING_WITHOUT_VALIDATION = False
+                
+                if not ALLOW_BOOKING_WITHOUT_VALIDATION:
+                    await self.publish_booking_cancelled(
+                        request.user_id,
+                        request.workout_id,
+                        f"User service unavailable: {str(e)}"
+                    )
+                    
+                    context.set_code(grpc.StatusCode.UNAVAILABLE)
+                    context.set_details(f"User service unavailable: {str(e)}")
+                    return booking_pb2.BookingResponse()
+                else:
+                    logger.warning("Using fallback: allowing booking without user validation")
+                    user_valid = True
+                    user_validation_message = "Fallback: User service unavailable"
+            
+            if not user_valid:
+                await self.publish_booking_cancelled(
+                    request.user_id,
+                    request.workout_id,
+                    f"User validation failed: {user_validation_message}"
+                )
+                
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details(f"User validation failed: {user_validation_message}")
+                return booking_pb2.BookingResponse()
+            
+            # Шаг 3: Резервирование слота в Schedule Service
+            try:
+                logger.info(f"Reserving slot for workout {request.workout_id}")
+                
+                async with grpc.aio.insecure_channel(self.schedule_service_address) as channel:
+                    stub = schedule_pb2_grpc.ScheduleServiceStub(channel)
+                    reserve_response = await stub.ReserveSlot(
+                        schedule_pb2.ReserveSlotRequest(
+                            workout_id=request.workout_id
+                        ),
+                        timeout=3.0
+                    )
+                
+                if not reserve_response.success:
+                    await self.publish_booking_cancelled(
+                        request.user_id,
+                        request.workout_id,
+                        f"Slot reservation failed: {reserve_response.message}"
+                    )
+                    
+                    context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                    context.set_details(reserve_response.message)
+                    return booking_pb2.BookingResponse()
+                    
+                logger.info(f"Slot reserved successfully. Current participants: {reserve_response.current_participants}")
+                
+            except grpc.RpcError as e:
+                await self.publish_booking_cancelled(
+                    request.user_id,
+                    request.workout_id,
+                    f"Schedule service error: {e.details()}"
+                )
+                
+                context.set_code(grpc.StatusCode.UNAVAILABLE)
+                context.set_details(f"Schedule service error: {e.details()}")
+                return booking_pb2.BookingResponse()
+            
+            # Шаг 4: Создание записи бронирования
             booking_id = str(uuid.uuid4())
+            logger.info(f"Creating booking record: {booking_id}")
             
             await self.pg_conn.execute(
                 """
@@ -136,12 +316,14 @@ class BookingService(booking_pb2_grpc.BookingServiceServicer):
                 request.workout_id
             )
             
-            # Publish BookingConfirmed event for Saga completion
+            # Шаг 5: Публикация события об успешном бронировании
             await self.publish_booking_confirmed(
                 booking_id,
                 request.user_id,
                 request.workout_id
             )
+            
+            logger.info(f"✅ Booking {booking_id} created successfully for user {request.user_id}")
             
             return await self.GetBooking(
                 booking_pb2.GetBookingRequest(booking_id=booking_id),
@@ -150,48 +332,24 @@ class BookingService(booking_pb2_grpc.BookingServiceServicer):
             
         except Exception as e:
             logger.error(f'CreateBooking failed: {str(e)}')
+            
+            # Всегда публикуем событие об отмене при ошибке
+            await self.publish_booking_cancelled(
+                request.user_id,
+                request.workout_id,
+                f"Booking creation failed: {str(e)}"
+            )
+            
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(f'CreateBooking failed: {str(e)}')
             return booking_pb2.BookingResponse()
     
-    @circuit(failure_threshold=5, recovery_timeout=30)
-    async def UserValidated(self, request, context):
-        """Circuit Breaker pattern for user validation"""
-        try:
-            async with grpc.aio.insecure_channel(self.user_service_address) as channel:
-                stub = user_pb2_grpc.UserServiceStub(channel)
-                response = await stub.ValidateSubscription(
-                    user_pb2.ValidateSubscriptionRequest(user_id=request.user_id)
-                )
-            
-            if response.valid:
-                return booking_pb2.UserValidationResponse(
-                    valid=True,
-                    message='User subscription is valid'
-                )
-            else:
-                return booking_pb2.UserValidationResponse(
-                    valid=False,
-                    message=response.message
-                )
-                
-        except grpc.RpcError as e:
-            logger.warning(f'User service unavailable: {e}')
-            # Fallback: allow booking if user service is down (circuit breaker open)
-            return booking_pb2.UserValidationResponse(
-                valid=True,
-                message='User service unavailable, proceeding with booking'
-            )
-        except Exception as e:
-            logger.error(f'User validation failed: {str(e)}')
-            return booking_pb2.UserValidationResponse(
-                valid=False,
-                message=f'User validation failed: {str(e)}'
-            )
-    
     async def CancelBooking(self, request, context):
+        """Отмена бронирования"""
         try:
-            # Get booking details
+            logger.info(f"Cancelling booking: {request.booking_id}")
+            
+            # Получаем информацию о бронировании
             booking = await self.pg_conn.fetchrow(
                 "SELECT * FROM bookings WHERE booking_id = $1",
                 request.booking_id
@@ -202,16 +360,20 @@ class BookingService(booking_pb2_grpc.BookingServiceServicer):
                 context.set_details('Booking not found')
                 return booking_pb2.BookingResponse()
             
-            # Cancel slot reservation
-            async with grpc.aio.insecure_channel(self.schedule_service_address) as channel:
-                stub = schedule_pb2_grpc.ScheduleServiceStub(channel)
-                await stub.CancelReservation(
-                    schedule_pb2.CancelReservationRequest(
-                        workout_id=booking['workout_id']
+            # Освобождаем слот в Schedule Service
+            try:
+                async with grpc.aio.insecure_channel(self.schedule_service_address) as channel:
+                    stub = schedule_pb2_grpc.ScheduleServiceStub(channel)
+                    await stub.CancelReservation(
+                        schedule_pb2.CancelReservationRequest(
+                            workout_id=booking['workout_id']
+                        )
                     )
-                )
+            except Exception as e:
+                logger.warning(f"Failed to cancel reservation in Schedule Service: {e}")
+                # Продолжаем даже если не удалось освободить слот
             
-            # Update booking status
+            # Обновляем статус бронирования
             await self.pg_conn.execute(
                 """
                 UPDATE bookings 
@@ -222,12 +384,14 @@ class BookingService(booking_pb2_grpc.BookingServiceServicer):
                 request.booking_id
             )
             
-            # Publish cancellation event
+            # Публикуем событие об отмене
             await self.publish_booking_cancelled(
                 booking['user_id'],
                 booking['workout_id'],
                 'Booking cancelled by user'
             )
+            
+            logger.info(f"✅ Booking {request.booking_id} cancelled successfully")
             
             return await self.GetBooking(request, context)
             
@@ -238,7 +402,10 @@ class BookingService(booking_pb2_grpc.BookingServiceServicer):
             return booking_pb2.BookingResponse()
     
     async def GetUserBookings(self, request, context):
+        """Получение бронирований пользователя"""
         try:
+            logger.info(f"Getting bookings for user: {request.user_id}")
+            
             bookings = await self.pg_conn.fetch(
                 "SELECT * FROM bookings WHERE user_id = $1 ORDER BY created_at DESC",
                 request.user_id
@@ -255,7 +422,9 @@ class BookingService(booking_pb2_grpc.BookingServiceServicer):
                     updated_at=str(booking['updated_at'])
                 ))
             
+            logger.info(f"Found {len(bookings)} bookings for user {request.user_id}")
             return response
+            
         except Exception as e:
             logger.error(f'GetUserBookings failed: {str(e)}')
             context.set_code(grpc.StatusCode.INTERNAL)
@@ -263,7 +432,10 @@ class BookingService(booking_pb2_grpc.BookingServiceServicer):
             return booking_pb2.BookingsResponse()
     
     async def GetBooking(self, request, context):
+        """Получение информации о бронировании"""
         try:
+            logger.info(f"Getting booking: {request.booking_id}")
+            
             booking = await self.pg_conn.fetchrow(
                 "SELECT * FROM bookings WHERE booking_id = $1",
                 request.booking_id
@@ -282,61 +454,119 @@ class BookingService(booking_pb2_grpc.BookingServiceServicer):
                 created_at=str(booking['created_at']),
                 updated_at=str(booking['updated_at'])
             )
+            
         except Exception as e:
             logger.error(f'GetBooking failed: {str(e)}')
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(f'GetBooking failed: {str(e)}')
             return booking_pb2.BookingResponse()
     
-    async def publish_booking_confirmed(self, booking_id, user_id, workout_id):
-        """Publish event to Kafka for Saga completion"""
+    async def UserValidated(self, request, context):
+        """Валидация пользователя (используется в SAGA)"""
+        try:
+            logger.info(f"Validating user for SAGA: {request.user_id}")
+            
+            # Проверка Circuit Breaker
+            can_proceed, reason = await self.can_proceed_with_booking()
+            if not can_proceed:
+                logger.warning(f"CIRCUIT BREAKER in UserValidated: {reason}")
+                return booking_pb2.UserValidationResponse(
+                    valid=False,
+                    message=f"CIRCUIT BREAKER: {reason}"
+                )
+            
+            try:
+                is_valid, message = await self.validate_user_with_circuit_breaker(request.user_id)
+                await self.check_and_update_circuit_breaker(error_occurred=False)
+                
+                return booking_pb2.UserValidationResponse(
+                    valid=is_valid,
+                    message=message
+                )
+                
+            except Exception as e:
+                await self.check_and_update_circuit_breaker(error_occurred=True)
+                
+                logger.error(f"User validation failed in UserValidated: {e}")
+                return booking_pb2.UserValidationResponse(
+                    valid=False,
+                    message=f"Service unavailable: {str(e)}"
+                )
+            
+        except Exception as e:
+            logger.error(f'UserValidated failed: {str(e)}')
+            return booking_pb2.UserValidationResponse(
+                valid=False,
+                message=f"Validation failed: {str(e)}"
+            )
+    
+    async def publish_booking_confirmed(self, booking_id: str, user_id: str, workout_id: str):
+        """Публикация события подтверждения бронирования"""
         try:
             event = {
                 'event_type': 'BookingConfirmed',
                 'booking_id': booking_id,
                 'user_id': user_id,
                 'workout_id': workout_id,
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.now().isoformat(),
+                'circuit_breaker_state': self.circuit_breaker_state
             }
             
-            await self.kafka_producer.send_and_wait(
-                'booking-events',
-                event
-            )
-            logger.info(f'Published BookingConfirmed event: {event}')
+            if self.kafka_producer:
+                await self.kafka_producer.send_and_wait(
+                    'booking-events',
+                    event
+                )
+                logger.info(f"📤 Published BookingConfirmed event: {booking_id}")
+            else:
+                logger.warning("Kafka producer not available, event not published")
+                
         except Exception as e:
             logger.error(f'Failed to publish booking confirmed event: {e}')
     
-    async def publish_booking_cancelled(self, user_id, workout_id, reason):
-        """Publish event to Kafka for Saga rollback"""
+    async def publish_booking_cancelled(self, user_id: str, workout_id: str, reason: str):
+        """Публикация события отмены бронирования"""
         try:
             event = {
                 'event_type': 'BookingCancelled',
                 'user_id': user_id,
                 'workout_id': workout_id,
                 'reason': reason,
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.now().isoformat(),
+                'circuit_breaker_state': self.circuit_breaker_state
             }
             
-            await self.kafka_producer.send_and_wait(
-                'booking-events',
-                event
-            )
-            logger.info(f'Published BookingCancelled event: {event}')
+            if self.kafka_producer:
+                await self.kafka_producer.send_and_wait(
+                    'booking-events',
+                    event
+                )
+                logger.info(f"📤 Published BookingCancelled event: {reason[:50]}...")
+            else:
+                logger.warning("Kafka producer not available, event not published")
+                
         except Exception as e:
             logger.error(f'Failed to publish booking cancelled event: {e}')
 
 async def serve():
+    """Запуск gRPC сервера"""
     server = grpc.aio.server()
     service = BookingService()
+    
+    # Подключаемся к БД и Kafka
     await service.pg_connect()
     await service.kafka_connect()
+    
+    # Регистрируем сервис
     booking_pb2_grpc.add_BookingServiceServicer_to_server(service, server)
     server.add_insecure_port('[::]:50053')
     
+    # Запускаем сервер
     await server.start()
-    logger.info("Booking Service started on port 50053")
+    logger.info("🚀 Booking Service started on port 50053")
+    logger.info(f"Circuit Breaker state: {service.circuit_breaker_state}")
     
+    # Основной цикл
     await server.wait_for_termination()
 
 if __name__ == '__main__':

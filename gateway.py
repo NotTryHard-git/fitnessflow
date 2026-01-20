@@ -568,12 +568,5 @@ async def update_statistics():
     result = await analytics_client.UpdateStatistics(data)
     return jsonify(result)
 
-# Эндпоинт для сброса тестовых данных (для тестирования)
-@app.route('/api/test/reset', methods=['POST'])
-async def reset_test_data():
-    # Этот эндпоинт только для тестирования
-    # В реальной системе не должен существовать
-    return jsonify({'message': 'Test reset endpoint'})
-
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=True)
